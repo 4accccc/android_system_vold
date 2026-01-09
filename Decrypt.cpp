@@ -20,6 +20,7 @@
 
 #include <map>
 #include <string>
+#include <vector>
 
 #include <errno.h>
 #include <stdio.h>
@@ -40,6 +41,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/types.h>
+#include <arpa/inet.h>
 #include <fstream>
 #include <future>
 #include <algorithm>
@@ -50,11 +52,6 @@
 #include <android-base/logging.h>
 #include <base/threading/platform_thread.h>
 #include <android/hardware/confirmationui/1.0/types.h>
-#include <aidl/android/hardware/security/keymint/HardwareAuthToken.h>
-#include <aidl/android/security/authorization/IKeystoreAuthorization.h>
-#include <aidl/android/security/apc/BnConfirmationCallback.h>
-#include <aidl/android/system/keystore2/IKeystoreService.h>
-#include <aidl/android/system/keystore2/ResponseCode.h>
 #include <android/hardware/gatekeeper/1.0/IGatekeeper.h>
 
 #include <binder/IServiceManager.h>
@@ -63,16 +60,12 @@
 
 #include <gatekeeper/GateKeeperResponse.h>
 
-#include <keystore/keystore.h>
-#include <keystore/keystore_client.h>
-#include <keystore/KeystoreResponse.h>
-#include <keystore/keystore_hidl_support.h>
-#include <keystore/keystore_return_types.h>
-#include <keystore/keymaster_types.h>
-#include <keymasterV4_1/Keymaster.h>
-#include <keystore/OperationResult.h>
-#include <keymint_support/authorization_set.h>
-#include <keymasterV4_1/keymaster_utils.h>
+// Direct Keymaster HIDL interface (bypassing keystore service)
+#include "Keymaster.h"
+#include <android/hardware/keymaster/4.0/IKeymasterDevice.h>
+#include <android/hardware/keymaster/4.0/types.h>
+#include <keymasterV4_0/authorization_set.h>
+#include <keymasterV4_0/keymaster_utils.h>
 
 extern "C" {
 #include "crypto_scrypt.h"
@@ -85,21 +78,10 @@ extern "C" {
 #include "KeyStorage.h"
 #include "android/os/IVold.h"
 
-namespace apc = ::aidl::android::security::apc;
-namespace keymint = ::aidl::android::hardware::security::keymint;
-namespace ks2 = ::aidl::android::system::keystore2;
-
-using ::aidl::android::hardware::security::keymint::HardwareAuthenticatorType;
-using ::aidl::android::hardware::security::keymint::HardwareAuthToken;
-using aidl::android::system::keystore2::IKeystoreService;
-using android::security::keymaster::OperationResult;
-using android::hardware::keymaster::V4_1::support::blob2hidlVec;
+// Direct Keymaster HIDL namespace
+namespace km_hidl = ::android::hardware::keymaster::V4_0;
 using android::hardware::gatekeeper::V1_0::GatekeeperResponse;
 using GKResponse = ::android::service::gatekeeper::GateKeeperResponse;
-
-inline std::string hidlVec2String(const ::keystore::hidl_vec<uint8_t>& value) {
-    return std::string(reinterpret_cast<const std::string::value_type*>(&value[0]), value.size());
-}
 
 static bool lookup_ref_key_internal(std::map<userid_t, android::fscrypt::EncryptionPolicy> key_map, const uint8_t* policy, uint8_t size, uint8_t hex_size, userid_t* user_id) {
 	char policy_string_hex[hex_size];
@@ -183,8 +165,11 @@ extern "C" bool lookup_ref_tar(fscrypt_policy *fep, uint8_t* policy) {
 }
 
 extern "C" bool Decrypt_DE() {
+	printf("[DEBUG] Decrypt_DE: ENTER\n");
 	printf("Attempting to initialize DE keys\n");
+	printf("[DEBUG] Decrypt_DE: calling fscrypt_initialize_systemwide_keys\n");
 	if (!fscrypt_initialize_systemwide_keys()) { // this deals with the overarching device encryption
+		printf("[DEBUG] Decrypt_DE: fscrypt_initialize_systemwide_keys FAILED\n");
 		printf("fscrypt_initialize_systemwide_keys returned fail\n");
 		return false;
 	}
@@ -374,27 +359,6 @@ bool Get_Weaver_Data(const std::string& spblob_path, const std::string& handle_s
 }
 
 namespace android {
-
-/* These next 2 functions try to get the keystore service 50 times because
- * the keystore is not always ready when TWRP boots */
-android::sp<IBinder> getKeystoreBinder() {
-	android::sp<IServiceManager> sm = android::defaultServiceManager();
-    return sm->getService(String16("android.security.keystore"));
-}
-
-android::sp<IBinder> getKeystoreBinderRetry() {
-	printf("Starting keystore...\n");
-    property_set("ctl.start", "keystore");
-	int retry_count = 50;
-	android::sp<IBinder> binder = getKeystoreBinder();
-	while (binder == NULL && retry_count) {
-		printf("Waiting for keystore service... %i\n", retry_count--);
-		sleep(1);
-		binder = getKeystoreBinder();
-	}
-	return binder;
-}
-
 namespace keystore {
 
 #define SYNTHETIC_PASSWORD_VERSION_V1 1
@@ -404,189 +368,530 @@ namespace keystore {
 #define SYNTHETIC_PASSWORD_KEY_PREFIX "USRSKEY_synthetic_password_"
 #define USR_PRIVATE_KEY_PREFIX "USRPKEY_synthetic_password_"
 #define PASSWORD_TOKEN_SIZE 32
-#define GK_ERROR *gkResponse = GKResponse::error(), Status::ok()
 
-	ks2::KeyDescriptor keyDescriptor(const std::string& alias) {
-		return {
-			.domain = ks2::Domain::SELINUX,
-			.nspace = NAMESPACE_LOCKSETTINGS,
-			.alias = alias,
-			.blob = {},
-		};
+static std::string mKey_Prefix;
+
+void copySqliteDb() {
+	std::string keystore_path = "/tmp/misc/keystore/";
+	mkdir("/tmp/misc", 0755);
+	mkdir("/tmp/misc/keystore", 0755);
+	std::string dst = keystore_path + "persistent.sqlite";
+	std::string src = "/data/misc/keystore/persistent.sqlite";
+	std::ifstream srcif(src.c_str(), std::ios::binary);
+	std::ofstream dstof(dst.c_str(), std::ios::binary);
+	printf("copying '%s' to '%s'\n", src.c_str(), dst.c_str());
+	dstof << srcif.rdbuf();
+	srcif.close();
+	dstof.close();
+}
+
+/* The keystore alias subid is sometimes the same as the handle, but not always.
+ * We scan keystore files and copy them to temp folder for operations. */
+bool Find_Keystore_Alias_SubID_And_Prep_Files(const userid_t user_id, std::string& keystoreid, const std::string& handle_str) {
+	char path_c[PATH_MAX];
+	sprintf(path_c, "/data/misc/keystore/user_%d", user_id);
+	char user_dir[PATH_MAX];
+	sprintf(user_dir, "user_%d", user_id);
+	std::string source_path = "/data/misc/keystore/";
+	source_path += user_dir;
+	std::string handle_sub = handle_str;
+	while (handle_sub.substr(0,1) == "0") {
+		std::string temp = handle_sub.substr(1);
+		handle_sub = temp;
 	}
+	mKey_Prefix = "";
 
-	int unwrapError(const ndk::ScopedAStatus& status) {
-		if (status.isOk()) return 0;
-		if (status.getExceptionCode() == EX_SERVICE_SPECIFIC) {
-			return status.getServiceSpecificError();
-		} else {
-			return static_cast<int>(ks2::ResponseCode::SYSTEM_ERROR);
+	mkdir("/tmp/misc", 0755);
+	mkdir("/tmp/misc/keystore", 0755);
+	std::string destination_path = "/tmp/misc/keystore/";
+	destination_path += user_dir;
+	if (mkdir(destination_path.c_str(), 0755) && errno != EEXIST) {
+		printf("failed to mkdir '%s' %s\n", destination_path.c_str(), strerror(errno));
+		return false;
+	}
+	destination_path += "/";
+
+	DIR* dir = opendir(source_path.c_str());
+	if (!dir) {
+		printf("Error opening '%s'\n", source_path.c_str());
+		return false;
+	}
+	source_path += "/";
+
+	struct dirent* de = 0;
+	size_t prefix_len = strlen(SYNTHETIC_PASSWORD_KEY_PREFIX);
+	bool found_subid = false;
+	bool has_pkey = false;
+
+	while ((de = readdir(dir)) != 0) {
+		if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+			continue;
+		if (!found_subid) {
+			size_t len = strlen(de->d_name);
+			if (len <= prefix_len)
+				continue;
+			if (strstr(de->d_name, SYNTHETIC_PASSWORD_KEY_PREFIX) && !has_pkey)
+				mKey_Prefix = SYNTHETIC_PASSWORD_KEY_PREFIX;
+			else if (strstr(de->d_name, USR_PRIVATE_KEY_PREFIX)) {
+				mKey_Prefix = USR_PRIVATE_KEY_PREFIX;
+				has_pkey = true;
+			} else
+				continue;
+			if (strstr(de->d_name, handle_sub.c_str())) {
+				keystoreid = handle_sub;
+				printf("keystoreid matched handle_sub: '%s'\n", keystoreid.c_str());
+				found_subid = true;
+			} else {
+				std::string file = de->d_name;
+				std::size_t found = file.find_last_of("_");
+				if (found != std::string::npos) {
+					keystoreid = file.substr(found + 1);
+				}
+			}
 		}
-	}
-
-	void copySqliteDb() {
-		std::string keystore_path = "/tmp/misc/keystore/";
-		std::string dst = keystore_path + "persistent.sqlite";
-		std::string src = "/data/misc/keystore/persistent.sqlite";
+		std::string src = source_path;
+		src += de->d_name;
 		std::ifstream srcif(src.c_str(), std::ios::binary);
+		std::string dst = destination_path;
+		dst += de->d_name;
+		std::size_t source_uid = dst.find("1000");
+		if (source_uid != std::string::npos)
+			dst.replace(source_uid, 4, "0");
 		std::ofstream dstof(dst.c_str(), std::ios::binary);
 		printf("copying '%s' to '%s'\n", src.c_str(), dst.c_str());
 		dstof << srcif.rdbuf();
 		srcif.close();
 		dstof.close();
 	}
+	closedir(dir);
+	if (!found_subid && !mKey_Prefix.empty() && !keystoreid.empty())
+		found_subid = true;
+	return found_subid;
+}
 
-	/* C++ replacement for function of the same name
-	* https://android.googlesource.com/platform/frameworks/base/+/android-8.0.0_r23/services/core/java/com/android/server/locksettings/SyntheticPasswordManager.java#867
-	* returning an empty string indicates an error */
-	std::string unwrapSyntheticPasswordBlob(const std::string& spblob_path, const std::string& handle_str, const userid_t user_id,
-		const void* application_id, const size_t application_id_size, uint32_t auth_token_len) {
-		printf("Attempting to unwrap synthetic password blob\n");
-		std::string disk_decryption_secret_key = "";
+/* C++ replacement for function of the same name using direct Keymaster HIDL
+ * https://android.googlesource.com/platform/frameworks/base/+/android-8.0.0_r23/services/core/java/com/android/server/locksettings/SyntheticPasswordManager.java#867
+ * returning an empty string indicates an error */
+std::string unwrapSyntheticPasswordBlob(const std::string& spblob_path, const std::string& handle_str, const userid_t user_id,
+	const void* application_id, const size_t application_id_size, uint32_t auth_token_len) {
+	printf("[SPBLOB] Attempting to unwrap synthetic password blob (Direct Keymaster HIDL)\n");
+	std::string disk_decryption_secret_key = "";
 
-		android::ProcessState::self()->startThreadPool();
+	std::string keystore_alias_subid;
+	std::string key_blob;
 
-		// Read the data from the .spblob file per: https://android.googlesource.com/platform/frameworks/base/+/android-8.0.0_r23/services/core/java/com/android/server/locksettings/SyntheticPasswordManager.java#869
-		std::string spblob_data;
-		if (!Get_Spblob_Data(spblob_path, handle_str, ".spblob", "spblob", &spblob_data))
-			return disk_decryption_secret_key;
-		unsigned char* byteptr = (unsigned char*)spblob_data.data();
-		if (*byteptr != SYNTHETIC_PASSWORD_VERSION_V2 && *byteptr != SYNTHETIC_PASSWORD_VERSION_V1
-				&& *byteptr != SYNTHETIC_PASSWORD_VERSION_V3) {
-			printf("Unsupported synthetic password version %i\n", *byteptr);
-			return disk_decryption_secret_key;
-		}
-		const unsigned char* synthetic_password_version = byteptr;
-		byteptr++;
-		if (*byteptr != SYNTHETIC_PASSWORD_PASSWORD_BASED) {
-			printf("spblob data is not SYNTHETIC_PASSWORD_PASSWORD_BASED\n");
-			return disk_decryption_secret_key;
-		}
-		byteptr++; // Now we're pointing to the blob data itself
-		if (*synthetic_password_version == SYNTHETIC_PASSWORD_VERSION_V2
-				|| *synthetic_password_version == SYNTHETIC_PASSWORD_VERSION_V3) {
-			printf("spblob v2 / v3\n");
-			/* Version 2 / 3 of the spblob is basically the same as version 1, but the order of getting the intermediate key and disk decryption key have been flip-flopped
-			* as seen in https://android.googlesource.com/platform/frameworks/base/+/5025791ac6d1538224e19189397de8d71dcb1a12
-			*/
-			/* First decrypt call found in
-			* https://android.googlesource.com/platform/frameworks/base/+/android-8.1.0_r18/services/core/java/com/android/server/locksettings/SyntheticPasswordCrypto.java#135
-			* We will use https://android.googlesource.com/platform/frameworks/base/+/android-8.0.0_r23/keystore/java/android/security/keystore/AndroidKeyStoreCipherSpiBase.java
-			* and https://android.googlesource.com/platform/frameworks/base/+/android-8.0.0_r23/keystore/java/android/security/keystore/AndroidKeyStoreAuthenticatedAESCipherSpi.java
-			* First we set some algorithm parameters as seen in two places:
-			* https://android.googlesource.com/platform/frameworks/base/+/android-8.0.0_r23/keystore/java/android/security/keystore/AndroidKeyStoreAuthenticatedAESCipherSpi.java#297
-			* https://android.googlesource.com/platform/frameworks/base/+/android-8.0.0_r23/keystore/java/android/security/keystore/AndroidKeyStoreAuthenticatedAESCipherSpi.java#216 */
-			// When using secdis (aka not weaver) you must supply an auth token to the keystore prior to the begin operation
-			int32_t ret;
-			size_t maclen = 128;
-			unsigned char* iv = (unsigned char*)byteptr; // The IV is the first 12 bytes of the spblob
-			::keystore::hidl_vec<uint8_t> iv_hidlvec;
-			iv_hidlvec.setToExternal((unsigned char*)byteptr, 12);
-			// printf("iv: "); output_hex((const unsigned char*)iv, 12); printf("\n");
+	// Find the keystore key file and read the key blob
+	char path_c[PATH_MAX];
+	bool found_key = false;
 
-			KeystoreInfo keystore_info;
-			std::string handle = keystore_info.getHandle(user_id);
-			std::string keystore_alias = keystore_info.getAlias(handle);
-			int32_t error_code;
-			unsigned char* cipher_text = (unsigned char*)byteptr + 12; // The cipher text comes immediately after the IV
-			std::string cipher_text_str(byteptr, byteptr + spblob_data.size() - 14);
-			::keystore::hidl_vec<uint8_t> cipher_text_hidlvec;
-
-			cipher_text_hidlvec.setToExternal(cipher_text, spblob_data.size() - 14 /* 1 each for version and SYNTHETIC_PASSWORD_PASSWORD_BASED and 12 for the iv */);
-			auto begin_params = keymint::AuthorizationSetBuilder()
-				.Authorization(keymint::TAG_ALGORITHM, ::keymint::Algorithm::AES)
-				.Authorization(::keymint::TAG_BLOCK_MODE, ::keymint::BlockMode::GCM)
-				.Padding(::keymint::PaddingMode::NONE)
-				.Authorization(keymint::TAG_PURPOSE, keymint::KeyPurpose::DECRYPT)
-				.Authorization(::keymint::TAG_NONCE, iv_hidlvec)
-				.Authorization(::keymint::TAG_MAC_LENGTH, maclen);
-
-			ks2::KeyEntryResponse keyEntryResponse;
-			::ndk::SpAIBinder keystoreBinder(AServiceManager_checkService("android.system.keystore2.IKeystoreService/default"));
-			auto keystore = ks2::IKeystoreService::fromBinder(keystoreBinder);
-			auto rc = keystore->getKeyEntry(keyDescriptor(keystore_alias), &keyEntryResponse);
-			if (!rc.isOk()) {
-				auto error = unwrapError(rc);
-				if (ks2::ResponseCode(error) == ks2::ResponseCode::KEY_NOT_FOUND) {
-					printf("key not found\n");
-				} else {
-					printf("Failed to get key entry: %s\n", rc.getDescription().c_str());
+	// Debug: list all files in keystore directories
+	for (const char* ks_path : {"/data/misc/keystore", "/data/misc/keystore/user_0"}) {
+		DIR* d = opendir(ks_path);
+		if (d) {
+			printf("[SPBLOB] Files in %s:\n", ks_path);
+			struct dirent* e;
+			while ((e = readdir(d)) != nullptr) {
+				if (e->d_name[0] != '.') {
+					printf("[SPBLOB]   %s\n", e->d_name);
 				}
-				return disk_decryption_secret_key;
 			}
-			std::variant<int, ks2::KeyEntryResponse> response = keyEntryResponse;
-			auto keyResponse = std::get<ks2::KeyEntryResponse>(response);
-			ks2::CreateOperationResponse encOperationResponse;
-			auto begin_rc = keyResponse.iSecurityLevel->createOperation(
-				keyResponse.metadata.key, begin_params.vector_data(), true,
-				&encOperationResponse);
-			if (!begin_rc.isOk()) {
-				printf("Begin Operation failed\n");
-				return disk_decryption_secret_key;
-			}
-			std::optional<std::vector<uint8_t>> optPlaintext;
+			closedir(d);
+		}
+	}
 
-			begin_rc = encOperationResponse.iOperation->finish(cipher_text_hidlvec, {}, &optPlaintext);
-			if (!begin_rc.isOk()) {
-				printf("finish reponse failed");
-				return disk_decryption_secret_key;
-			}
+	// Check for master key file
+	std::string masterkey;
+	if (android::base::ReadFileToString("/data/misc/keystore/.masterkey", &masterkey)) {
+		printf("[SPBLOB] Found .masterkey file, size=%zu\n", masterkey.size());
+	} else {
+		printf("[SPBLOB] No .masterkey file found\n");
+	}
 
-			size_t keystore_result_size = optPlaintext->size();
-			unsigned char* keystore_result = (unsigned char*)malloc(keystore_result_size);
-			if (!keystore_result) {
-				printf("malloc on keystore_result\n");
-				return disk_decryption_secret_key;
-			}
-			memcpy(keystore_result, &optPlaintext->front(), keystore_result_size);
+	// Try user's keystore first, then user 0
+	for (int try_user : {(int)user_id, 0}) {
+		sprintf(path_c, "/data/misc/keystore/user_%d", try_user);
+		DIR* dir = opendir(path_c);
+		if (!dir) continue;
 
-			const unsigned char* intermediate_iv = keystore_result;
-			// printf("intermediate_iv: "); output_hex((const unsigned char*)intermediate_iv, 12); printf("\n");
-			const unsigned char* intermediate_cipher_text = (const unsigned char*)keystore_result + 12; // The cipher text comes immediately after the IV
-			int cipher_size = keystore_result_size - 12;
-			// First we personalize as seen https://android.googlesource.com/platform/frameworks/base/+/android-8.0.0_r23/services/core/java/com/android/server/locksettings/SyntheticPasswordCrypto.java#102
-			void* personalized_application_id = PersonalizedHashBinary(PERSONALISATION_APPLICATION_ID, (const char*)application_id, application_id_size);
-			if (!personalized_application_id) {
-				printf("Unable to obtain personalized_application_id\n");
-				return disk_decryption_secret_key;
+		std::string handle_sub = handle_str;
+		while (handle_sub.substr(0,1) == "0" && handle_sub.length() > 1) {
+			handle_sub = handle_sub.substr(1);
+		}
+
+		struct dirent* de;
+		while ((de = readdir(dir)) != nullptr) {
+			std::string filename = de->d_name;
+			if (filename.find(SYNTHETIC_PASSWORD_KEY_PREFIX) != std::string::npos ||
+			    filename.find(USR_PRIVATE_KEY_PREFIX) != std::string::npos) {
+				if (filename.find(handle_sub) != std::string::npos) {
+					std::string key_file = std::string(path_c) + "/" + filename;
+					printf("[SPBLOB] Found key file: %s\n", key_file.c_str());
+					if (android::base::ReadFileToString(key_file, &key_blob)) {
+						found_key = true;
+						keystore_alias_subid = handle_sub;
+						break;
+					}
+				}
 			}
-			// printf("personalized application id: "); output_hex((unsigned char*)personalized_application_id, SHA512_DIGEST_LENGTH); printf("\n");
-			// Now we'll decrypt using openssl AES/GCM/NoPadding
-			OpenSSL_add_all_ciphers();
-			int actual_size=0, final_size=0;
-			EVP_CIPHER_CTX *d_ctx = EVP_CIPHER_CTX_new();
-			const unsigned char* key = (const unsigned char*)personalized_application_id; // The key is the now personalized copy of the application ID
-			// printf("key: "); output_hex((const unsigned char*)key, 32); printf("\n");
-			EVP_DecryptInit(d_ctx, EVP_aes_256_gcm(), key, intermediate_iv);
-			unsigned char* secret_key = (unsigned char*)malloc(cipher_size);
-			if (!secret_key) {
-				printf("malloc failure on secret key\n");
-				return disk_decryption_secret_key;
-			}
-			EVP_DecryptUpdate(d_ctx, secret_key, &actual_size, intermediate_cipher_text, cipher_size);
-			unsigned char tag[AES_BLOCK_SIZE];
-			EVP_CIPHER_CTX_ctrl(d_ctx, EVP_CTRL_GCM_SET_TAG, 16, tag);
-			EVP_DecryptFinal_ex(d_ctx, secret_key + actual_size, &final_size);
-			EVP_CIPHER_CTX_free(d_ctx);
-			free(personalized_application_id);
-			free(keystore_result);
-			int secret_key_real_size = actual_size - 16;
-			// printf("secret key:  "); output_hex((const unsigned char*)secret_key, secret_key_real_size); printf("\n");
-			// The payload data from the keystore update is further personalized at https://android.googlesource.com/platform/frameworks/base/+/android-8.0.0_r23/services/core/java/com/android/server/locksettings/SyntheticPasswordManager.java#153
-			// We now have the disk decryption key!
-			if (*synthetic_password_version == SYNTHETIC_PASSWORD_VERSION_V3) {
-				// V3 uses SP800 instead of SHA512
-				disk_decryption_secret_key = PersonalizedHashSP800(PERSONALIZATION_FBE_KEY, PERSONALISATION_CONTEXT, (const char*)secret_key, secret_key_real_size);
+		}
+		closedir(dir);
+		if (found_key) break;
+	}
+
+	if (!found_key || key_blob.empty()) {
+		printf("[SPBLOB] Failed to find keystore key file\n");
+		return disk_decryption_secret_key;
+	}
+	printf("[SPBLOB] Read key blob, size=%zu\n", key_blob.size());
+
+	// Debug: dump first 48 bytes of key blob to understand format
+	if (key_blob.size() >= 48) {
+		printf("[SPBLOB] Key blob header (first 48 bytes):\n");
+		const unsigned char* kb = (const unsigned char*)key_blob.data();
+		printf("[SPBLOB]   Bytes 0-15:  ");
+		for (int i = 0; i < 16; i++) printf("%02x ", kb[i]);
+		printf("\n[SPBLOB]   Bytes 16-31: ");
+		for (int i = 16; i < 32; i++) printf("%02x ", kb[i]);
+		printf("\n[SPBLOB]   Bytes 32-47: ");
+		for (int i = 32; i < 48; i++) printf("%02x ", kb[i]);
+		printf("\n");
+		// Interpret as keystore blob format
+		printf("[SPBLOB]   Keystore blob: version=%d type=%d flags=%d info=%d\n",
+			kb[0], kb[1], kb[2], kb[3]);
+	}
+
+	// Parse keystore blob format to extract actual keymaster blob
+	// Format: version(1) + type(1) + flags(1) + info(1) + [IV(16) + tag(16) + length(4)] + data
+	if (key_blob.size() >= 4) {
+		const unsigned char* kb = (const unsigned char*)key_blob.data();
+		uint8_t ks_version = kb[0];
+		uint8_t ks_type = kb[1];
+		uint8_t ks_flags = kb[2];
+
+		printf("[SPBLOB] Parsing keystore blob: version=%d type=%d flags=0x%02x\n",
+			ks_version, ks_type, ks_flags);
+
+		// For blobv3 (version=3) with TYPE_KEYMASTER_10 (type=4)
+		if (ks_version == 3 && ks_type == 4) {
+			// Check if encrypted (flags & 1) or super-encrypted (flags & 2)
+			bool is_encrypted = (ks_flags & 0x01) || (ks_flags & 0x02);
+
+			if (!is_encrypted || ks_flags == 8) {
+				// Not encrypted by master key, or flags=8 (special case)
+				// Try different offsets to find the keymaster blob
+				// Blob has lots of zeros from byte 4-38, data seems to start around byte 39
+				size_t offsets[] = {4, 39, 40, 36, 44};
+				for (size_t offset : offsets) {
+					if (key_blob.size() > offset) {
+						std::string km_blob = key_blob.substr(offset);
+						printf("[SPBLOB] Trying keymaster blob at offset %zu, size=%zu\n",
+							offset, km_blob.size());
+
+						// Dump first 16 bytes of extracted blob
+						if (km_blob.size() >= 16) {
+							printf("[SPBLOB]   First 16 bytes: ");
+							for (int i = 0; i < 16; i++)
+								printf("%02x ", (unsigned char)km_blob[i]);
+							printf("\n");
+						}
+					}
+				}
+
+				// Analyze the internal structure after keystore header
+				// Bytes 36-39 appear to be length (big endian), data starts at 40
+				// But offset 40 gives us "01 02 00 00" which might be another header
+				// Try offset 44 where actual keymaster blob data might start
+
+				// Print more of the blob for analysis
+				if (key_blob.size() >= 64) {
+					printf("[SPBLOB] Extended hex dump (bytes 36-63):\n");
+					const unsigned char* kb = (const unsigned char*)key_blob.data();
+					printf("[SPBLOB]   36-51: ");
+					for (int i = 36; i < 52; i++) printf("%02x ", kb[i]);
+					printf("\n[SPBLOB]   52-63: ");
+					for (int i = 52; i < 64; i++) printf("%02x ", kb[i]);
+					printf("\n");
+				}
+
+				// Try multiple offsets and test each with keymaster
+				printf("[SPBLOB] Testing different offsets with keymaster...\n");
+				size_t try_offsets[] = {0, 4, 40, 44};
+				for (size_t offset : try_offsets) {
+					if (key_blob.size() > offset + 16) {
+						std::string test_blob = key_blob.substr(offset);
+						printf("[SPBLOB] Testing offset %zu (size=%zu): ", offset, test_blob.size());
+
+						// Quick test with getKeyCharacteristics
+						android::vold::Keymaster km_test;
+						if (km_test) {
+							android::vold::km::AuthorizationSet hw, sw;
+							km_test.getKeyCharacteristics(test_blob, &hw, &sw);
+						}
+					}
+				}
+
+				// Use offset 40 (confirmed working with getKeyCharacteristics)
+				size_t best_offset = 40;
+				if (key_blob.size() > best_offset) {
+					key_blob = key_blob.substr(best_offset);
+					printf("[SPBLOB] Using keymaster blob from offset %zu, new size=%zu\n", best_offset, key_blob.size());
+				}
 			} else {
-				disk_decryption_secret_key = PersonalizedHash(PERSONALIZATION_FBE_KEY, (const char*)secret_key, secret_key_real_size);
+				printf("[SPBLOB] Keystore blob is encrypted (flags=0x%02x), cannot decrypt without master key\n", ks_flags);
+				return disk_decryption_secret_key;
 			}
-			// printf("disk_decryption_secret_key: '%s'\n", disk_decryption_secret_key.c_str());
+		}
+	}
+
+	// Read the data from the .spblob file
+	std::string spblob_data;
+	if (!Get_Spblob_Data(spblob_path, handle_str, ".spblob", "spblob", &spblob_data))
+		return disk_decryption_secret_key;
+
+	unsigned char* byteptr = (unsigned char*)spblob_data.data();
+	if (*byteptr != SYNTHETIC_PASSWORD_VERSION_V2 && *byteptr != SYNTHETIC_PASSWORD_VERSION_V1
+			&& *byteptr != SYNTHETIC_PASSWORD_VERSION_V3) {
+		printf("[SPBLOB] Unsupported synthetic password version %i\n", *byteptr);
+		return disk_decryption_secret_key;
+	}
+	const unsigned char* synthetic_password_version = byteptr;
+	byteptr++;
+	if (*byteptr != SYNTHETIC_PASSWORD_PASSWORD_BASED) {
+		printf("[SPBLOB] spblob data is not SYNTHETIC_PASSWORD_PASSWORD_BASED\n");
+		return disk_decryption_secret_key;
+	}
+	byteptr++; // Now we're pointing to the blob data itself
+
+	if (*synthetic_password_version == SYNTHETIC_PASSWORD_VERSION_V2
+			|| *synthetic_password_version == SYNTHETIC_PASSWORD_VERSION_V3) {
+		printf("[SPBLOB] spblob v2/v3 - using direct Keymaster HIDL\n");
+
+		// Extract IV and cipher text from spblob
+		const unsigned char* iv = byteptr;
+		const unsigned char* cipher_text = byteptr + 12;
+		size_t cipher_text_size = spblob_data.size() - 14; // 2 bytes header + 12 bytes IV
+
+		printf("[SPBLOB] IV size=12, cipher_text_size=%zu\n", cipher_text_size);
+
+		// Get Keymaster device
+		android::vold::Keymaster keymaster;
+		if (!keymaster) {
+			printf("[SPBLOB] Failed to get Keymaster device\n");
+			return disk_decryption_secret_key;
+		}
+
+		// First, try to get key characteristics to understand the key type
+		printf("[SPBLOB] Checking key characteristics...\n");
+		android::vold::km::AuthorizationSet hwEnforced, swEnforced;
+		if (keymaster.getKeyCharacteristics(key_blob, &hwEnforced, &swEnforced)) {
+			printf("[SPBLOB] Got key characteristics successfully\n");
+		} else {
+			printf("[SPBLOB] Failed to get key characteristics (may need upgrade)\n");
+		}
+
+		// Build authorization set for AES-GCM decryption
+		// Use android::vold::km namespace which is keymint AIDL types
+		using android::vold::km::AuthorizationSetBuilder;
+		using android::vold::km::TAG_PURPOSE;
+		using android::vold::km::TAG_ALGORITHM;
+		using android::vold::km::TAG_BLOCK_MODE;
+		using android::vold::km::TAG_PADDING;
+		using android::vold::km::TAG_NONCE;
+		using android::vold::km::TAG_MAC_LENGTH;
+		using android::vold::km::KeyPurpose;
+		using android::vold::km::Algorithm;
+		using android::vold::km::BlockMode;
+		using android::vold::km::PaddingMode;
+		using android::vold::KeymasterOperation;
+
+		std::vector<uint8_t> nonce_vec(iv, iv + 12);
+		auto params = AuthorizationSetBuilder()
+			.Authorization(TAG_PURPOSE, KeyPurpose::DECRYPT)
+			.Authorization(TAG_ALGORITHM, Algorithm::AES)
+			.Authorization(TAG_BLOCK_MODE, BlockMode::GCM)
+			.Authorization(TAG_PADDING, PaddingMode::NONE)
+			.Authorization(TAG_NONCE, nonce_vec)
+			.Authorization(TAG_MAC_LENGTH, 128);
+
+		android::vold::km::AuthorizationSet outParams;
+
+		// Read auth token from file written by gatekeeper verification
+		android::hardware::keymaster::V4_0::HardwareAuthToken authToken;
+		bool hasAuthToken = false;
+		if (auth_token_len > 0) {
+			std::string auth_token_data;
+			if (android::base::ReadFileToString("/auth_token", &auth_token_data)) {
+				printf("[SPBLOB] Read auth_token file, size=%zu\n", auth_token_data.size());
+				// Parse hw_auth_token_t format (69 bytes):
+				// version(1) + challenge(8) + user_id(8) + authenticator_id(8) +
+				// authenticator_type(4) + timestamp(8) + hmac(32)
+				if (auth_token_data.size() >= 69) {
+					const uint8_t* p = (const uint8_t*)auth_token_data.data();
+					uint8_t version = p[0];
+					p += 1;
+					memcpy(&authToken.challenge, p, 8); p += 8;
+					memcpy(&authToken.userId, p, 8); p += 8;
+					memcpy(&authToken.authenticatorId, p, 8); p += 8;
+					uint32_t authType;
+					memcpy(&authType, p, 4); p += 4;
+					// Convert from network byte order
+					authType = ntohl(authType);
+					authToken.authenticatorType = static_cast<android::hardware::keymaster::V4_0::HardwareAuthenticatorType>(authType);
+					uint64_t timestamp;
+					memcpy(&timestamp, p, 8); p += 8;
+					// Convert from network byte order (swap bytes for 64-bit)
+					timestamp = ((timestamp & 0x00000000000000FFULL) << 56) |
+					            ((timestamp & 0x000000000000FF00ULL) << 40) |
+					            ((timestamp & 0x0000000000FF0000ULL) << 24) |
+					            ((timestamp & 0x00000000FF000000ULL) << 8) |
+					            ((timestamp & 0x000000FF00000000ULL) >> 8) |
+					            ((timestamp & 0x0000FF0000000000ULL) >> 24) |
+					            ((timestamp & 0x00FF000000000000ULL) >> 40) |
+					            ((timestamp & 0xFF00000000000000ULL) >> 56);
+					authToken.timestamp = timestamp;
+					authToken.mac.resize(32);
+					memcpy(authToken.mac.data(), p, 32);
+					hasAuthToken = true;
+					printf("[SPBLOB] Parsed auth token: challenge=%llu, userId=%llu, authType=%d, timestamp=%llu\n",
+						(unsigned long long)authToken.challenge,
+						(unsigned long long)authToken.userId,
+						(int)authToken.authenticatorType,
+						(unsigned long long)authToken.timestamp);
+				} else {
+					printf("[SPBLOB] Auth token too small: %zu bytes\n", auth_token_data.size());
+				}
+			} else {
+				printf("[SPBLOB] Failed to read /auth_token\n");
+			}
+		}
+
+		// Begin decryption operation with key blob
+		KeymasterOperation op;
+		if (hasAuthToken) {
+			printf("[SPBLOB] Using begin() with auth token\n");
+			op = keymaster.begin(key_blob, params, &outParams, authToken);
+		} else {
+			printf("[SPBLOB] Using begin() without auth token\n");
+			op = keymaster.begin(key_blob, params, &outParams);
+		}
+
+		// Handle KEY_REQUIRES_UPGRADE (-33 in HIDL) by upgrading the key and retrying
+		// Use raw value comparison since keymint AIDL ErrorCode values differ from HIDL
+		int error_code = static_cast<int>(op.getErrorCode());
+		printf("[SPBLOB] Keymaster begin returned error code: %d\n", error_code);
+
+		if (!op && error_code == -33) {  // -33 = KEY_REQUIRES_UPGRADE in HIDL keymaster
+			printf("[SPBLOB] Key requires upgrade (error -33), attempting upgrade...\n");
+
+			// Build upgrade params (empty for most cases)
+			android::vold::km::AuthorizationSet upgradeParams;
+			std::string upgraded_key_blob;
+
+			if (keymaster.upgradeKey(key_blob, upgradeParams, &upgraded_key_blob)) {
+				printf("[SPBLOB] Key upgrade succeeded, size=%zu\n", upgraded_key_blob.size());
+				key_blob = upgraded_key_blob;
+
+				// Retry begin with upgraded key (with auth token if available)
+				if (hasAuthToken) {
+					op = keymaster.begin(key_blob, params, &outParams, authToken);
+				} else {
+					op = keymaster.begin(key_blob, params, &outParams);
+				}
+				if (op) {
+					printf("[SPBLOB] Retry after upgrade succeeded\n");
+				} else {
+					printf("[SPBLOB] Retry after upgrade failed: %d\n", static_cast<int>(op.getErrorCode()));
+				}
+			} else {
+				printf("[SPBLOB] Key upgrade failed\n");
+				return disk_decryption_secret_key;
+			}
+		}
+
+		if (!op) {
+			printf("[SPBLOB] Keymaster begin failed: %d\n", error_code);
+			return disk_decryption_secret_key;
+		}
+		printf("[SPBLOB] Keymaster begin succeeded\n");
+
+		// Update with cipher text
+		std::string input_data((const char*)cipher_text, cipher_text_size);
+		std::string keystore_result;
+		if (!op.updateCompletely(input_data, &keystore_result)) {
+			printf("[SPBLOB] Keymaster update failed\n");
+			return disk_decryption_secret_key;
+		}
+		printf("[SPBLOB] Keymaster update succeeded, result_size=%zu\n", keystore_result.size());
+
+		// Finish operation
+		std::string finish_output;
+		if (!op.finish(&finish_output)) {
+			printf("[SPBLOB] Keymaster finish failed\n");
+			return disk_decryption_secret_key;
+		}
+		keystore_result += finish_output;
+		printf("[SPBLOB] Keymaster finish succeeded, total_size=%zu\n", keystore_result.size());
+
+		if (keystore_result.size() < 12) {
+			printf("[SPBLOB] Keymaster result too small\n");
+			return disk_decryption_secret_key;
+		}
+
+		// Second decrypt with OpenSSL AES/GCM using personalized application ID
+		const unsigned char* intermediate_iv = (const unsigned char*)keystore_result.data();
+		const unsigned char* intermediate_cipher_text = (const unsigned char*)keystore_result.data() + 12;
+		int intermediate_cipher_size = keystore_result.size() - 12;
+
+		void* personalized_application_id = PersonalizedHashBinary(PERSONALISATION_APPLICATION_ID,
+			(const char*)application_id, application_id_size);
+		if (!personalized_application_id) {
+			printf("[SPBLOB] Unable to obtain personalized_application_id\n");
+			return disk_decryption_secret_key;
+		}
+
+		OpenSSL_add_all_ciphers();
+		int actual_size = 0, final_size = 0;
+		EVP_CIPHER_CTX *d_ctx = EVP_CIPHER_CTX_new();
+		const unsigned char* key = (const unsigned char*)personalized_application_id;
+		EVP_DecryptInit(d_ctx, EVP_aes_256_gcm(), key, intermediate_iv);
+
+		unsigned char* secret_key = (unsigned char*)malloc(intermediate_cipher_size);
+		if (!secret_key) {
+			printf("[SPBLOB] malloc failure on secret key\n");
+			free(personalized_application_id);
+			EVP_CIPHER_CTX_free(d_ctx);
+			return disk_decryption_secret_key;
+		}
+
+		EVP_DecryptUpdate(d_ctx, secret_key, &actual_size, intermediate_cipher_text, intermediate_cipher_size);
+		unsigned char tag[AES_BLOCK_SIZE];
+		EVP_CIPHER_CTX_ctrl(d_ctx, EVP_CTRL_GCM_SET_TAG, 16, tag);
+		EVP_DecryptFinal_ex(d_ctx, secret_key + actual_size, &final_size);
+		EVP_CIPHER_CTX_free(d_ctx);
+		free(personalized_application_id);
+
+		int secret_key_real_size = actual_size - 16;
+		if (secret_key_real_size <= 0) {
+			printf("[SPBLOB] Invalid secret key size: %d\n", secret_key_real_size);
 			free(secret_key);
 			return disk_decryption_secret_key;
 		}
+
+		// Generate disk decryption key
+		if (*synthetic_password_version == SYNTHETIC_PASSWORD_VERSION_V3) {
+			disk_decryption_secret_key = PersonalizedHashSP800(PERSONALIZATION_FBE_KEY,
+				PERSONALISATION_CONTEXT, (const char*)secret_key, secret_key_real_size);
+		} else {
+			disk_decryption_secret_key = PersonalizedHash(PERSONALIZATION_FBE_KEY,
+				(const char*)secret_key, secret_key_real_size);
+		}
+		printf("[SPBLOB] Successfully generated disk decryption secret key\n");
+		free(secret_key);
 		return disk_decryption_secret_key;
 	}
+	return disk_decryption_secret_key;
 }
+
 // /* C++ replacement for
 //  * https://android.googlesource.com/platform/frameworks/base/+/android-8.0.0_r23/services/core/java/com/android/server/locksettings/SyntheticPasswordManager.java#992
 //  * called here
@@ -769,44 +1074,44 @@ bool Decrypt_User_Synth_Pass(const userid_t user_id, const std::string& Password
 				return Free_Return(retval, weaver_key, &pwd);
 			}
 			android::hardware::hidl_vec<uint8_t> gk_pwd_token_hidl;
-			GKResponse gkResponse;
 			gk_pwd_token_hidl.setToExternal(const_cast<uint8_t *>((const uint8_t *)gk_pwd_token), SHA512_DIGEST_LENGTH);
+
+			// Android 10: Use file-based auth token approach
+			// The keystore refuses root user to supply auth tokens directly,
+			// so we write the auth token to a file and use keystore_auth service
 			android::hardware::Return<void> hwRet =
 				gk_device->verify(fakeUid(user_id), 0 /* challenge */,
 								  pwd_handle_hidl,
 								  gk_pwd_token_hidl,
-								  [&gkResponse]
-									// []
+								  [&ret, &request_reenroll, &auth_token_len]
 									(const android::hardware::gatekeeper::V1_0::GatekeeperResponse &rsp) {
-										// ret = static_cast<int>(rsp.code); // propagate errors
+										ret = static_cast<int>(rsp.code);
 										if (rsp.code >= android::hardware::gatekeeper::V1_0::GatekeeperStatusCode::STATUS_OK) {
-											gkResponse = GKResponse::ok({rsp.data.begin(), rsp.data.end()});
-											const hw_auth_token_t* hwAuthToken =
-												reinterpret_cast<const hw_auth_token_t*>(gkResponse.payload().data());
-											HardwareAuthToken authToken;
-											authToken.timestamp.milliSeconds = betoh64(hwAuthToken->timestamp);
-											authToken.challenge = hwAuthToken->challenge;
-											authToken.userId = hwAuthToken->user_id;
-											authToken.authenticatorId = hwAuthToken->authenticator_id;
-											authToken.authenticatorType = static_cast<HardwareAuthenticatorType>(
-													betoh32(hwAuthToken->authenticator_type));
-											authToken.mac.assign(&hwAuthToken->hmac[0], &hwAuthToken->hmac[32]);
-											AIBinder* authzAIBinder = AServiceManager_getService("android.security.authorization");
-											::ndk::SpAIBinder binder(authzAIBinder);
-											auto service = aidl::android::security::authorization::IKeystoreAuthorization::fromBinder(binder);
-											if (service == NULL) {
-												printf("error: could not connect to keystore service\n");
-												ALOGE("error: could not connect to keystore service\n");
+											auth_token_len = rsp.data.size();
+											request_reenroll = (rsp.code == android::hardware::gatekeeper::V1_0::GatekeeperStatusCode::STATUS_REENROLL);
+											ret = 0;
+											// Write auth token to file for keystore_auth service
+											unlink("/auth_token");
+											FILE* auth_file = fopen("/auth_token", "wb");
+											if (auth_file != NULL) {
+												fwrite(rsp.data.data(), sizeof(uint8_t), rsp.data.size(), auth_file);
+												fclose(auth_file);
+												printf("[SECDIS] Auth token written to /auth_token (%zu bytes)\n", rsp.data.size());
+											} else {
+												printf("[SECDIS] failed to open /auth_token for writing\n");
+												ret = -2;
 											}
-											auto binder_result = service->addAuthToken(authToken);
+										} else if (rsp.code == android::hardware::gatekeeper::V1_0::GatekeeperStatusCode::ERROR_RETRY_TIMEOUT && rsp.timeout > 0) {
+											ret = rsp.timeout;
 										}
 									}
 								 );
 			free(gk_pwd_token);
-			if (!hwRet.isOk()) {
-				printf("gatekeeper verification failed\n");
+			if (!hwRet.isOk() || ret != 0) {
+				printf("gatekeeper verification failed (ret=%d)\n", ret);
 				return Free_Return(retval, weaver_key, &pwd);
 			}
+			printf("[SECDIS] Gatekeeper verification succeeded\n");
 		}
 	}
 	// Now we will handle https://android.googlesource.com/platform/frameworks/base/+/android-8.0.0_r23/services/core/java/com/android/server/locksettings/SyntheticPasswordManager.java#816
@@ -882,6 +1187,7 @@ extern "C" int Get_Password_Type(const userid_t user_id, std::string& filename) 
 }
 
 extern "C" bool Decrypt_User(const userid_t user_id, const std::string& Password) {
+	printf("[DEBUG] Decrypt_User: ENTER user_id=%d\n", user_id);
 	printf("Attempting to decrypt user\n");
     uint8_t *auth_token;
     uint32_t auth_token_len;
@@ -965,4 +1271,5 @@ extern "C" bool Decrypt_User(const userid_t user_id, const std::string& Password
 	}
 	return true;
 }
-}
+}  // namespace keystore
+}  // namespace android

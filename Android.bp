@@ -176,6 +176,7 @@ cc_library_static {
         "android.hardware.gatekeeper@1.0",
         "android.hardware.health.storage@1.0",
         "android.hardware.health.storage-V1-ndk_platform",
+        "android.hardware.keymaster@4.0",
         "android.hardware.keymaster@4.1",
         "android.hardware.security.keymint-V1-ndk_platform",
         "android.hardware.weaver@1.0",
@@ -191,6 +192,7 @@ cc_library_static {
         "libhidlbase",
         "liblog",
         "libchrome",
+        "libkeymaster4support",
         "libkeymaster4_1support",
         "libkeystoreinfo",
         "libkeystore-attestation-application-id",
@@ -226,9 +228,13 @@ cc_binary {
     shared_libs: [
         "android.hardware.health.storage@1.0",
         "android.hardware.health.storage-V1-ndk_platform",
+        "android.hardware.keymaster@4.0",
+        "android.hardware.keymaster@4.1",
         "android.system.keystore2-V1-ndk_platform",
         "android.security.maintenance-ndk_platform",
         "libbinder_ndk",
+        "libkeymaster4support",
+        "libkeymaster4_1support",
         "libkeymint_support",
     ],
 
@@ -279,8 +285,16 @@ cc_binary {
         "libbinder",
         "libbinder_ndk",
 
+        // HIDL Keymaster V4.0/V4.1 support
+        "android.hardware.keymaster@4.0",
+        "android.hardware.keymaster@4.1",
+        "libkeymaster4support",
+        "libkeymaster4_1support",
+
+        // Keystore2 AIDL (for compatibility)
         "android.system.keystore2-V1-ndk_platform",
         "android.security.maintenance-ndk_platform",
+
         "libhardware",
         "libhardware_legacy",
         "libhidlbase",
@@ -365,9 +379,13 @@ cc_binary {
     shared_libs: [
         "android.hardware.health.storage@1.0",
         "android.hardware.health.storage-V1-ndk_platform",
+        "android.hardware.keymaster@4.0",
+        "android.hardware.keymaster@4.1",
         "android.system.keystore2-V1-ndk_platform",
         "android.security.maintenance-ndk_platform",
         "libbinder_ndk",
+        "libkeymaster4support",
+        "libkeymaster4_1support",
         "libkeymint_support",
     ]
 }
